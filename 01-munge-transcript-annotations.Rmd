@@ -1,0 +1,261 @@
+---
+title: "Processing transcriptome annotations and transcript-level quantification using Salmon"
+subtitle: ""
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: readable
+        toc: true
+        toc_depth: 1
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+```
+
+# Background
+
+Here, we investigate the impact of different choices of transcriptome
+annotations on isoform-level quantifications from RNA-seq. We first
+quantify RNA-seq data from [120 fetal human brain
+samples](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1567-1),
+using [Salmon](https://salmon.readthedocs.io/en/latest/index.html) with
+various transcriptome annotations, such as different versions of GENCODE
+and in-house annotations generated from single-cell Iso-seq (long-read)
+data.
+
+# Download GENCODE annotations
+
+We download [the latest GENCODE
+annotation](https://www.gencodegenes.org/human/) for the human genome
+(GRCh37), which is Release 38. We download the comprehensive gene
+annotation file in [GTF
+format](https://uswest.ensembl.org/info/website/upload/gff.html). We
+also download Relsease 33, which has been used by Cindy, and we use the
+annotation files for GRCh37, not GRCh38, because GRCh37 has been
+previously used by our lab members, and hence they are more suitable for
+direct comparison, although it comes with [its own
+caveats](http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/_README_GRCh37_mapping.txt).
+(***TODO's***: The effect of using [GRCh37 instead of
+GRCh38](http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/_README.TXT)
+could be further studied. We could even quantify RNA-seq based on older
+versions of GENCODE, such as v19 used by PsychENCODE or v26 used by
+GTEx. RefSeq transcriptome annotation, which is largely a subset of
+GENCODE annotations could be also investigated.)
+
+```{r, eval=FALSE}
+# Download GENCODE .gtf files
+system("curl ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/GRCh37_mapping/gencode.v38lift37.annotation.gtf.gz --output GENCODE/hg37/gencode.v38lift37.annotation.gtf.gz")
+
+system("curl ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_33/GRCh37_mapping/gencode.v33lift37.annotation.gtf.gz --output GENCODE/hg37/gencode.v33lift37.annotation.gtf.gz")
+```
+
+# Munge GENCODE annotations
+
+In addition to using raw GENCODE GTF files to quantify RNA-seq data, we
+created additional GENCODE files by filtering transcripts based on
+`transcript support level`, where the score of 1 corresponds to best
+line of evidence and the score of 5 less convincing evidence. This
+information is contained in the last column of GTF file. Only
+transcripts with `transcript support level` less than three were
+included. (***TODO's***: We could potentially apply additional filters,
+such as including only manually annotated HAVANA transcripts or
+transcripts with [tag
+"basic"](https://www.gencodegenes.org/pages/tags.html), but such filters
+can lead to substantially smaller number of transcripts. For example,
+only selecting transcripts with
+[CAGE_supported_TSS](https://www.gencodegenes.org/pages/tags.html) would
+leave only about 2,000 transcripts, which is far too small of a number.)
+
+```{r, eval=FALSE}
+library(tidyverse)
+annot <- read_delim("GENCODE/hg37/gencode.v38lift37.annotation.gtf.gz", 
+                    delim = "\t", skip = 5, col_names = FALSE)
+dim(annot)
+colnames(annot) <- c("chromosome", "source", "feature", "start", "end", 
+                     "score", "strand", "phase", "info")
+
+# Extract transcript ID
+annot$transcript_id <- str_extract(annot$info, 
+                                   "transcript_id (.*?);") %>% 
+  str_remove("transcript_id \"") %>% 
+  str_remove("\";")
+
+annot_transcript <- annot %>% 
+  filter(feature == "transcript")
+# 238,613 transcripts for GENCODE v38
+# 229,692 transcripts for GENCODE v33
+
+# Extract transcript support level info
+annot_transcript$tsl <- str_extract(annot_transcript$info, 
+                                    "transcript_support_level (.*?);") %>% 
+  str_remove("transcript_support_level ") %>%
+  str_remove("\"") %>%
+  str_remove("\"") %>% 
+  str_remove(";")
+
+annot_transcript %>% 
+  count(tsl)
+
+# Extract gene ID
+annot_transcript$gene_id <- str_extract(annot_transcript$info, 
+                                        "gene_id (.*?);") %>% 
+  str_remove("gene_id \"") %>% 
+  str_remove("\";")
+
+# Extract gene name
+annot_transcript$gene_name <- str_extract(annot_transcript$info, 
+                                        "gene_name (.*?);") %>% 
+  str_remove("gene_name \"") %>% 
+  str_remove("\";")
+
+# Extract transcript name
+annot_transcript$transcript_name <- str_extract(annot_transcript$info, 
+                                        "transcript_name (.*?);") %>% 
+  str_remove("transcript_name \"") %>% 
+  str_remove("\";")
+
+annot_transcript$level <- str_extract(annot_transcript$info, 
+                                        "level (.*?);") %>% 
+  str_remove("level") %>%
+  str_remove(";")
+
+# Extract transcript type
+annot_transcript$transcript_type <- str_extract(annot_transcript$info, 
+                                        "transcript_type (.*?);") %>% 
+  str_remove("transcript_type \"") %>%
+  str_remove("\";")
+
+annot_transcript$tag <- str_extract(annot_transcript$info, 
+                                        "tag (.*?);") %>% 
+  str_remove("tag \"") %>%
+  str_remove("\";")
+
+annot_transcript_filter <- annot_transcript %>% 
+  filter(tsl %in% c(1, 2, 3))
+# 113,308 transcripts for GENCODE v38
+# 113,878 transcripts for GENCODE v33
+
+xtabs(~ level + tsl, annot_transcript)
+cor.test(as.numeric(annot_transcript$tsl), as.numeric(annot_transcript$level))
+xtabs(~ transcript_type + tsl, annot_transcript)
+xtabs(~ level + tsl, annot_transcript_filter)
+xtabs(~ tag + tsl, annot_transcript_filter)
+
+annot %>% 
+  filter(feature %in% c("transcript", "exon")) %>% 
+  semi_join(annot_transcript_filter, by = "transcript_id") %>% 
+  select(-10) %>% 
+  write_tsv(file = "gencode.v38lift37.annotation.filter.gtf", 
+            col_names = FALSE, quote = "none", escape = "none")
+# write_tsv can also write .gz file,
+# but here we save it as .gtf to use it as an input to `gffread`
+```
+
+# Munge Ashok's single-cell long-read annotations
+
+Different transcriptome annotations generated from Ashok's long-read are
+also used for transcript-level quantification.
+`ashok-isoform.annotation.pseudobulk.gtf.gz` contains all transcripts
+supported by three or more reads (\~170k isoforms), while
+`ashok-isoform.annotation.7189.allsinglecells.gtf.gz` contains isoforms
+with UMI \> 85 (\~140k isoforms).
+`ashok-isoform.annotation.7189.allsinglecells.gtf.gz` is a smaller
+subset of `ashok-isoform.annotation.pseudobulk.gtf.gz`. Finally,
+`ashok-gencode.v33lift37.pseudobulk.gtf.gz` combines GENCODE v33 with
+`ashok-isoform.annotation.pseudobulk.gtf.gz`. Each of these three
+annotations are used to run Salmon.
+
+```{r, eval=FALSE}
+annot <- read_delim("GENCODE/hg37/ashok-gencode.v33lift37.pseudobulk.gtf.gz", 
+                    delim = "\t", skip = 5, col_names = FALSE)
+dim(annot)
+colnames(annot) <- c("chromosome", "source", "feature", "start", "end", 
+                     "score", "strand", "phase", "info")
+
+annot$transcript_id <- str_extract(annot$info, 
+                                   "transcript_id (.*?);") %>% 
+  str_remove("transcript_id \"") %>% 
+  str_remove("\";")
+
+annot %>% 
+  count(feature)
+# 142,573 transcripts for isoform.annotation.7189.allsinglecells
+# 173,782 transcripts for isoform.annotation.pseudobulk
+# 355,861 transcripts for gencode.v33lift37.pseudobulk
+
+annot %>% 
+  filter(feature %in% c("transcript", "exon")) %>% 
+  select(-10) %>% 
+  write_tsv(file = "ashok-gencode.v33lift37.pseudobulk.transcripts.gtf", 
+            col_names = FALSE, quote = "none", escape = "none")
+```
+
+# Create transcriptome fasta files for Salmon indices
+
+We use
+[`gffread`](http://ccb.jhu.edu/software/stringtie/gff.shtml#gffread_ex)
+to extract transcript sequences from the GRCh37 fasta file. Such
+transcript fasta files are subsequently used to create [Salmon
+indices](https://salmon.readthedocs.io/en/latest/salmon.html#preparing-transcriptome-indices-mapping-based-mode),
+which are used for pseudoalignment.
+
+```{bash, eval=FALSE}
+gffread-0.12.6.Linux_x86_64/gffread GENCODE/hg37/gencode.v33lift37.annotation.filter.gtf -g GENCODE/hg37/GRCh37.primary_assembly.genome.fa -w GENCODE/hg37/gencode.v33lift37.filter.transcripts.fa
+
+gzip GENCODE/hg37/gencode.v33lift37.filter.transcripts.fa
+
+cat GENCODE/hg37/gencode.v33lift37.filter.transcripts.fa.gz GENCODE/hg37/GRCh37.primary_assembly.genome.fa.gz > salmon_index/gencode.v33lift37.filter.transcripts.decoy.fa.gz
+
+salmon-1.5.1_linux_x86_64/bin/salmon index -t salmon_index/gencode.v33lift37.filter.transcripts.decoy.fa.gz -d salmon_index/decoys.txt -p 4 -i salmon_index/gencode.v33lift37.filter.salmon_index --gencode
+```
+
+# Quantify using Salmon
+
+We usedthe following bash script to run Salmon and hence quantify
+transcript-level counts. (***TODO's***: Salmon quantifications should be
+compared against STAR + RSEM quantifcations, which use a similar
+expectation-maximization (EM)-based optimization.)
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#$ -l h_data=4G,h_rt=12:00:00,highp
+#$ -cwd
+#$ -pe shared 12
+#$ -j y
+#$ -o ./log/obrien.out
+#$ -m a
+#$ -t 1-120
+cd /u/project/gandalm/shared/bigsummer
+ANNOT=gencode.v33lift37.filter
+SALMON_INDEX=./salmon_index/${ANNOT}.salmon_index
+INPUT_FILE=/u/project/gandalm/cindywen/isoform_twas/star/sample_list_obrien.txt
+INLINE=`head -n ${SGE_TASK_ID} ${INPUT_FILE} | tail -n 1`
+IFS=$'\t' 
+params=(${INLINE})
+SAMPLE_ID=${params[0]}
+IN_FASTQS_R1=${params[1]}
+IN_FASTQS_R2=${params[2]}
+SAMPLE_PATH=./obrien/${ANNOT}/${SAMPLE_ID}
+mkdir -p ${SAMPLE_PATH}
+./salmon-1.5.1_linux_x86_64/bin/salmon quant -i ${SALMON_INDEX} -l A -1 ${IN_FASTQS_R1} -2 ${IN_FASTQS_R2} --validateMappings --useEM --seqBias --gcBias -p 12 -o ${SAMPLE_PATH}
+```
+
+# Load transcript-level quantification
+
+We read in quantification result for one sample as a sanity check.
+
+```{r, eval=FALSE}
+sample <- read_delim("obrien/gencode.v33lift37.filter/1117/quant.sf", delim = "\t")
+sample %>% 
+  mutate(normalized = NumReads / EffectiveLength) %>% 
+  mutate(estimateTPM = normalized / sum(normalized) * 1e6) %>% 
+  head()
+# some degree of discordance between estimated TPM and TPM of Salmon output, 
+# not sure why
+```
