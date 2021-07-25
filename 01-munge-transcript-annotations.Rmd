@@ -248,7 +248,7 @@ mkdir -p ${SAMPLE_PATH}
 
 # Load transcript-level quantification
 
-We read in quantification result for one sample as a sanity check.
+We can read in quantification result for one sample as a sanity check.
 
 ```{r, eval=FALSE}
 sample <- read_delim("obrien/gencode.v33lift37.filter/1117/quant.sf", delim = "\t")
@@ -259,3 +259,50 @@ sample %>%
 # some degree of discordance between estimated TPM and TPM of Salmon output, 
 # not sure why
 ```
+
+We can also read in the entire quantification results using either [tximport](https://bioconductor.org/packages/release/bioc/vignettes/tximport/inst/doc/tximport.html) or [tximeta](https://bioconductor.org/packages/devel/bioc/vignettes/tximeta/inst/doc/tximeta.html) package. 
+
+```{r, eval=FALSE}
+library(tximport)
+library(readr)
+library(stringr)
+library(dplyr)
+
+# Designate sample paths
+samples <- list.files("./obrien/gencode.v33lift37", full.names = TRUE)
+files <- file.path(samples, "quant.sf")
+names(files) <- sapply(strsplit(files, "/"), function(x) {x[length(x) - 1]})
+files <- files[file.exists(files)]
+
+# Transcript-level counts
+txi <- tximport(files, type = "salmon", txOut = TRUE, dropInfReps = TRUE)
+# have to take a closer look into countsFromAbundance = "lengthScaledTPM" option
+write.table(txi$counts, file = "./obrien/gencode.v33lift37/tx.counts.tsv", 
+            quote = FALSE, sep = "\t")
+
+# Construct transcript to gene correspondence
+annot <- read_delim("GENCODE/hg37/gencode.v33lift37.annotation.gtf.gz", 
+                    delim = "\t", skip = 5, col_names = FALSE)
+colnames(annot) <- c("chromosome", "source", "feature", "start", "end", 
+                     "score", "strand", "phase", "info")
+annot <- annot %>% 
+  filter(feature == "transcript")
+annot$gene_id <- str_extract(annot$info, "gene_id (.*?);") %>% 
+  str_remove("gene_id \"") %>% 
+  str_remove("\";")
+annot$transcript_id <- str_extract(annot$info, "transcript_id (.*?);") %>% 
+  str_remove("transcript_id \"") %>% 
+  str_remove("\";")
+transcripts <- tibble(transcript_id = rownames(txi$counts))
+tx2gene <- annot %>% 
+  semi_join(transcripts, by = "transcript_id") %>% 
+  select(transcript_id, gene_id)
+
+# Gene-level counts
+txi.sum <- summarizeToGene(txi, tx2gene)
+#txi.sum <- tximport(files, type = "salmon", tx2gene = tx2gene, 
+#                    dropInfReps = TRUE, countsFromAbundance = "no")
+write.table(txi.sum$counts, file = "./obrien/gencode.v33lift37/gene.counts.tsv", 
+            quote = FALSE, sep = "\t")
+```
+
