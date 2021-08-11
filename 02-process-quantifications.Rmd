@@ -1,0 +1,320 @@
+---
+title: "Analyzing transcript-level quantification from Salmon"
+subtitle: ""
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        theme: readable
+        toc: true
+        toc_depth: 1
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+```
+
+
+```{r, eval=FALSE}
+library(tximport)
+library(readr)
+library(stringr)
+library(dplyr)
+
+# Designate sample paths
+dir <- c("gencode.v33lift37", "gencode.v38lift37",
+         "gencode.v33lift37.filter", "gencode.v38lift37.filter")
+for (i in 1:length(dir)) {
+  path <- file.path("./obrien", dir[i])
+  samples <- list.files(path, full.names = TRUE)
+  files <- file.path(samples, "quant.sf")
+  names(files) <- sapply(strsplit(files, "/"), function(x) {x[length(x) - 1]})
+  files <- files[file.exists(files)]
+  # Transcript-level counts
+  txi <- tximport(files, type = "salmon", txOut = TRUE, dropInfReps = TRUE)
+  # have to take a closer look into countsFromAbundance = "lengthScaledTPM" option
+  write.table(txi$abundance, file = file.path(path, "tx.tpm.tsv"), 
+              quote = FALSE, sep = "\t")
+}
+```
+
+```{r, eval=FALSE}
+library(tidyverse)
+
+# Read data
+dir <- c("gencode.v33lift37", "gencode.v38lift37",
+         "gencode.v33lift37.filter", "gencode.v38lift37.filter")
+df <- list()
+for (i in 1:length(dir)) {
+  df[[dir[i]]] <- read.table(file.path(dir[i], "tx.tpm.tsv"), header = TRUE)
+}
+
+sampleID <- intersect(colnames(df[[1]]), colnames(df[[2]]))  # gencode.v33lift37 missing one sample
+for (i in 1:length(dir)) {
+  df[[dir[i]]] <- df[[dir[i]]][, match(sampleID, colnames(df[[dir[i]]]))]
+  if (i == 3 || i == 4) {
+    df[[dir[i]]] <- df[[dir[i]]][-grep("PAR_Y", rownames(df[[dir[i]]])), ]  # duplicated transcript id's, par_y
+  }
+  df[[dir[i]]] <- rownames_to_column(df[[dir[i]]]) %>% as_tibble(df)
+  df[[dir[i]]]$rowname <- pull(df[[i]], rowname) %>% str_remove("_.*")
+}
+
+length(intersect(df[[2]]$rowname, df[[4]]$rowname))  # some lack of overlap
+
+# TSL filter and no filter, within sample comparison
+df1 <- df[[1]] %>% filter(rowname %in% intersect(df[[1]]$rowname, df[[3]]$rowname))
+df3 <- df[[3]] %>% filter(rowname %in% intersect(df[[1]]$rowname, df[[3]]$rowname))
+df2 <- df[[2]] %>% filter(rowname %in% intersect(df[[2]]$rowname, df[[4]]$rowname))
+df4 <- df[[4]] %>% filter(rowname %in% intersect(df[[2]]$rowname, df[[4]]$rowname))
+
+dfcor <- tibble()
+
+for (i in 2:ncol(df3)) {
+  if (i %% 10 == 0) print(i)
+  c1 <- cor.test(pull(df1[, i]), pull(df3[, i]), use = "pairwise.complete.obs")
+  c2 <- cor.test(pull(df2[, i]), pull(df4[, i]), use = "pairwise.complete.obs")
+  dfcor <- bind_rows(dfcor,
+                     tibble(sample = colnames(df3)[i], R = c1$estimate, P = c1$p.value, comparison = "v33 vs v33 (tsl)"),
+                     tibble(sample = colnames(df3)[i], R = c2$estimate, P = c2$p.value, comparison = "v38 vs v38 (tsl)"))
+}
+
+dfcor %>% 
+  group_by(comparison) %>% 
+  summarize(m = mean(R), s = sd(R))
+
+dfcor$class <- "No filter vs filter"
+
+# Older and more recent GENCODE comparison, within sample comparison
+df1 <- df[[1]] %>% filter(rowname %in% intersect(df[[1]]$rowname, df[[2]]$rowname))
+df2 <- df[[2]] %>% filter(rowname %in% intersect(df[[1]]$rowname, df[[2]]$rowname))
+df3 <- df[[3]] %>% filter(rowname %in% intersect(df[[3]]$rowname, df[[4]]$rowname))
+df4 <- df[[4]] %>% filter(rowname %in% intersect(df[[3]]$rowname, df[[4]]$rowname))
+
+dfcor1 <- tibble()
+
+for (i in 2:ncol(df3)) {
+  if (i %% 10 == 0) print(i)
+  c1 <- cor.test(pull(df1[, i]), pull(df2[, i]), use = "pairwise.complete.obs")
+  c2 <- cor.test(pull(df3[, i]), pull(df4[, i]), use = "pairwise.complete.obs")
+  dfcor1 <- bind_rows(dfcor1,
+                      tibble(sample = colnames(df3)[i], R = c1$estimate, P = c1$p.value, comparison = "v33 vs v38"),
+                      tibble(sample = colnames(df3)[i], R = c2$estimate, P = c2$p.value, comparison = "v33 (tsl) vs v38 (tsl)"))
+}
+
+dfcor1 %>% 
+  group_by(comparison) %>% 
+  summarize(m = mean(R), s = sd(R)) 
+
+dfcor1$class <- "Old vs new"
+
+bind_rows(dfcor, dfcor1) %>% 
+  ggplot(aes(x = as.factor(comparison), y = R)) + 
+  geom_boxplot(outlier.size = 0, width = 0.6) + 
+  geom_jitter(width = 0.2, alpha = 0.7, size = 0.6) +
+  labs(y = expression(paste("Correlation coefficient (", italic("R"), ")")),
+       title = "Within sample correlation for TPM normalized data") + theme_bw() + 
+  theme(axis.title.x = element_blank(), panel.grid = element_blank(), legend.position = "none") + 
+  facet_grid(.~ class, scales = "free")
+
+ggsave("within-sample.png", width = 726, height = 403, scale = 1/100, dpi = 600)
+
+# Construct transcript to gene correspondence
+annot <- read_delim("gencode.v33lift37.annotation.gtf.gz", 
+                    delim = "\t", skip = 5, col_names = FALSE)
+colnames(annot) <- c("chromosome", "source", "feature", "start", "end", 
+                     "score", "strand", "phase", "info")
+annot <- annot %>% 
+  filter(feature %in% c("transcript"))
+annot$gene_id <- str_extract(annot$info, "gene_id (.*?);") %>% 
+  str_remove("gene_id \"") %>% 
+  str_remove("\";") %>% 
+  str_remove("_.*")
+annot$transcript_id <- str_extract(annot$info, "transcript_id (.*?);") %>% 
+  str_remove("transcript_id \"") %>% 
+  str_remove("\";") %>% 
+  str_remove("_.*")
+
+df_gene <- list()
+for (i in c(1, 3)) {
+  df_gene[[dir[i]]] <- inner_join(annot, df[[dir[i]]], by = c("transcript_id" = "rowname"))
+  df_gene[[dir[i]]] <- df_gene[[dir[i]]] %>% 
+    select(gene_id, X1117:X19052) %>% 
+    group_by(gene_id) %>% 
+    summarize_all(sum)
+}
+
+annot <- read_delim("gencode.v38lift37.annotation.gtf.gz", 
+                    delim = "\t", skip = 5, col_names = FALSE)
+colnames(annot) <- c("chromosome", "source", "feature", "start", "end", 
+                     "score", "strand", "phase", "info")
+annot <- annot %>% 
+  filter(feature %in% c("transcript"))
+annot$gene_id <- str_extract(annot$info, "gene_id (.*?);") %>% 
+  str_remove("gene_id \"") %>% 
+  str_remove("\";") %>% 
+  str_remove("_.*")
+annot$transcript_id <- str_extract(annot$info, "transcript_id (.*?);") %>% 
+  str_remove("transcript_id \"") %>% 
+  str_remove("\";") %>% 
+  str_remove("_.*")
+
+for (i in c(2, 4)) {
+  df_gene[[dir[i]]] <- inner_join(annot, df[[dir[i]]], by = c("transcript_id" = "rowname"))
+  df_gene[[dir[i]]] <- df_gene[[dir[i]]] %>% 
+    select(gene_id, X1117:X19052) %>% 
+    group_by(gene_id) %>% 
+    summarize_all(sum)
+}
+
+
+## Gene-level counts using tximport
+#library(tximport)
+#transcripts <- tibble(transcript_id = rownames(txi$counts))
+#tx2gene <- annot %>% 
+#  semi_join(transcripts, by = "transcript_id") %>% 
+#  select(transcript_id, gene_id)
+#txi.sum <- summarizeToGene(txi, tx2gene)
+##txi.sum <- tximport(files, type = "salmon", tx2gene = tx2gene, 
+##                    dropInfReps = TRUE, countsFromAbundance = "no")
+#write.table(txi.sum$counts, file = "./obrien/ashok-isoform.annotation.7189.allsinglecells/gene.counts.tsv", 
+#            quote = FALSE, sep = "\t")
+
+# TSL filter and no filter, within sample comparison
+df1 <- df_gene[[1]] %>% filter(gene_id %in% intersect(df_gene[[1]]$gene_id, df_gene[[2]]$gene_id))
+df3 <- df_gene[[2]] %>% filter(gene_id %in% intersect(df_gene[[1]]$gene_id, df_gene[[2]]$gene_id))
+df2 <- df_gene[[3]] %>% filter(gene_id %in% intersect(df_gene[[3]]$gene_id, df_gene[[4]]$gene_id))
+df4 <- df_gene[[4]] %>% filter(gene_id %in% intersect(df_gene[[3]]$gene_id, df_gene[[4]]$gene_id))
+
+dfcor <- tibble()
+
+for (i in 2:ncol(df3)) {
+  if (i %% 10 == 0) print(i)
+  c1 <- cor.test(pull(df1[, i]), pull(df3[, i]), use = "pairwise.complete.obs")
+  c2 <- cor.test(pull(df2[, i]), pull(df4[, i]), use = "pairwise.complete.obs")
+  dfcor <- bind_rows(dfcor,
+                     tibble(sample = colnames(df3)[i], R = c1$estimate, P = c1$p.value, comparison = "v33 vs v33 (tsl)"),
+                     tibble(sample = colnames(df3)[i], R = c2$estimate, P = c2$p.value, comparison = "v38 vs v38 (tsl)"))
+}
+
+dfcor %>% 
+  group_by(comparison) %>% 
+  summarize(m = mean(R), s = sd(R))
+
+dfcor$class <- "No filter vs filter"
+
+# Older and more recent GENCODE comparison, within sample comparison
+df1 <- df_gene[[1]] %>% filter(gene_id %in% intersect(df_gene[[1]]$gene_id, df_gene[[3]]$gene_id))
+df2 <- df_gene[[3]] %>% filter(gene_id %in% intersect(df_gene[[1]]$gene_id, df_gene[[3]]$gene_id))
+df3 <- df_gene[[2]] %>% filter(gene_id %in% intersect(df_gene[[2]]$gene_id, df_gene[[4]]$gene_id))
+df4 <- df_gene[[4]] %>% filter(gene_id %in% intersect(df_gene[[2]]$gene_id, df_gene[[4]]$gene_id))
+
+dfcor1 <- tibble()
+
+for (i in 2:ncol(df3)) {
+  if (i %% 10 == 0) print(i)
+  c1 <- cor.test(pull(df1[, i]), pull(df2[, i]), use = "pairwise.complete.obs")
+  c2 <- cor.test(pull(df3[, i]), pull(df4[, i]), use = "pairwise.complete.obs")
+  dfcor1 <- bind_rows(dfcor1,
+                      tibble(sample = colnames(df3)[i], R = c1$estimate, P = c1$p.value, comparison = "v33 vs v38"),
+                      tibble(sample = colnames(df3)[i], R = c2$estimate, P = c2$p.value, comparison = "v33 (tsl) vs v38 (tsl)"))
+}
+
+dfcor1 %>% 
+  group_by(comparison) %>% 
+  summarize(m = mean(R), s = sd(R)) 
+
+dfcor1$class <- "Old vs new"
+
+bind_rows(dfcor, dfcor1) %>% 
+  ggplot(aes(x = as.factor(comparison), y = R)) + 
+  geom_boxplot(outlier.size = 0, width = 0.6) + 
+  geom_jitter(width = 0.2, alpha = 0.7, size = 0.6) +
+  labs(y = expression(paste("Correlation coefficient (", italic("R"), ")")),
+       title = "Within sample correlation for gene-level TPM data") + theme_bw() + 
+  theme(axis.title.x = element_blank(), panel.grid = element_blank(), legend.position = "none") + 
+  facet_grid(.~ class, scales = "free")
+
+ggsave("within-sample-gene.png", width = 726, height = 403, scale = 1/100, dpi = 600)
+
+# Expression level comparison
+df1 <- df[[1]] %>% filter(rowname %in% intersect(df[[1]]$rowname, df[[3]]$rowname))
+df2 <- df[[1]] %>% filter(rowname %in% setdiff(df[[1]]$rowname, df[[3]]$rowname))
+
+df1 <- df1 %>%
+  rowwise() %>%
+  mutate(med = median(c_across(where(is.numeric)), na.rm = TRUE))
+
+df2 <- df2 %>%
+  rowwise() %>%
+  mutate(med = median(c_across(where(is.numeric)), na.rm = TRUE))
+
+wilcox.test(df1$med, df2$med)
+df_med <- bind_rows(tibble(med = df1$med, feature = "unfiltered"), 
+                    tibble(med = df2$med, feature = "filtered"))
+
+ggplot(df_med, aes(x = as.factor(feature), y = log2(med + 1))) + 
+geom_boxplot(outlier.size = 0, width = 0.6) + 
+labs(y = expression(paste("Correlation coefficient (", italic("R"), ")")),
+     title = "Within sample correlation for TPM normalized data") + theme_bw() + 
+theme(axis.title.x = element_blank(), panel.grid = element_blank(), legend.position = "none")
+
+# TSL filter and no filter, between sample comparison
+dfcor <- tibble()
+
+df3 %>%
+  mutate(sum = rowSums(across(where(is.numeric)))) %>% 
+  count(sum)
+
+intersect(df1 %>%
+            mutate(sum = rowSums(across(where(is.numeric)))) %>% 
+            filter(sum == 0) %>% 
+            select(rowname),
+          df3 %>%
+            mutate(sum = rowSums(across(where(is.numeric)))) %>% 
+            filter(sum == 0) %>% 
+            select(rowname))
+
+for (i in 1:max(nrow(df3), nrow(df4))) {
+  if (i %% 1000 == 0) print(i)
+  if (i <= nrow(df3)) {
+      c1 <- cor.test(as.numeric(df1[i, -1]), as.numeric(df3[i, -1]), use = "pairwise.complete.obs")
+      dfcor <- bind_rows(dfcor, 
+                         tibble(gene = df3$rowname[i], R = c1$estimate, P = c1$p.value, comparison = "1 vs 3"))
+  }
+  if (i <= nrow(df4)) {
+      c2 <- cor.test(as.numeric(df2[i, -1]), as.numeric(df4[i, -1]), use = "pairwise.complete.obs")
+      dfcor <- bind_rows(dfcor, 
+                         tibble(gene = df4$rowname[i], R = c2$estimate, P = c2$p.value, comparison = "2 vs 4"))
+  }
+}
+
+dfcor %>% 
+  group_by(comparison) %>% 
+  summarize(m = mean(R, na.rm = TRUE), s = sd(R, na.rm = TRUE))
+
+# Older and more recent GENCODE comparison, between sample comparison
+dfcor <- tibble()
+
+for (i in 1:max(nrow(df1), nrow(df3))) {
+  if (i %% 1000 == 0) print(i)
+  if (i <= nrow(df1)) {
+      c1 <- cor.test(as.numeric(df1[i, -1]), as.numeric(df2[i, -1]), use = "pairwise.complete.obs")
+      dfcor <- bind_rows(dfcor, 
+                         tibble(gene = df1$rowname[i], R = c1$estimate, P = c1$p.value, comparison = "1 vs 2"))
+  }
+  if (i <= nrow(df3)) {
+      c2 <- cor.test(as.numeric(df3[i, -1]), as.numeric(df4[i, -1]), use = "pairwise.complete.obs")
+      dfcor <- bind_rows(dfcor, 
+                         tibble(gene = df3$rowname[i], R = c2$estimate, P = c2$p.value, comparison = "3 vs 4"))
+  }
+}
+
+dfcor %>% 
+  group_by(comparison) %>% 
+  summarize(m = mean(R, na.rm = TRUE), s = sd(R, na.rm = TRUE))
+```
+
